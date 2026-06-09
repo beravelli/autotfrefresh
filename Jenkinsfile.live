@@ -79,7 +79,7 @@ pipeline {
     )
     string(
       name: 'GIT_CREDENTIALS_ID',
-      defaultValue: 'github-creds',
+      defaultValue: '65bff261-a30b-4bc5-90c0-65c23b4ce2ab',
       description: 'Jenkins credentials ID (username+password/token) used to push module ref updates back to GitHub.'
     )
   }
