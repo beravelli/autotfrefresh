@@ -72,6 +72,16 @@ pipeline {
       defaultValue: 'https://github.com/beravelli/autotfrefresh.git',
       description: 'Repo URL used for module version drift check.'
     )
+    booleanParam(
+      name: 'UPDATE_MODULES',
+      defaultValue: false,
+      description: 'If stale stacks are found, prompt to bump their module refs and commit back to the repo.'
+    )
+    string(
+      name: 'GIT_CREDENTIALS_ID',
+      defaultValue: 'github-creds',
+      description: 'Jenkins credentials ID (username+password/token) used to push module ref updates back to GitHub.'
+    )
   }
 
   environment {
@@ -103,17 +113,30 @@ pipeline {
       when { expression { params.CHECK_MODULE_VERSIONS } }
       steps {
         script {
+          sh "mkdir -p '${env.PLAN_DIR}'"
+          env.UPDATES_FILE = "${env.PLAN_DIR}/stale_stacks.tsv"
+
           def envArg = params.ENV_FILTER?.trim() ?: ''
           def rc = sh(
             script: """
               bash scripts/check_module_versions.sh \
                 '${params.MODULE_REPO_URL}' \
-                '${envArg}'
+                '${envArg}' \
+                '${env.UPDATES_FILE}'
             """,
             returnStatus: true
           )
           if (rc > 0) {
-            env.DRIFT_WARN = "⚠ ${rc} stack(s) are behind their latest module tag — review before applying"
+            env.DRIFT_WARN  = "⚠ ${rc} stack(s) are behind their latest module tag — review before applying"
+            env.STALE_COUNT = "${rc}"
+            // Build a human-readable list for the approval message
+            env.STALE_LIST = sh(
+              script: """
+                awk -F'|' '{printf "  %-40s %s/%s → %s/%s\\n", \$1, \$2, \$3, \$2, \$4}' \
+                  '${env.UPDATES_FILE}'
+              """,
+              returnStdout: true
+            ).trim()
             echo ""
             echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
             echo " ${env.DRIFT_WARN}"
@@ -122,8 +145,67 @@ pipeline {
             // Non-fatal — operator may intend to apply without bumping module versions
           } else {
             echo "✓ All stacks are on the latest module tags."
-            env.DRIFT_WARN = ''
+            env.DRIFT_WARN  = ''
+            env.STALE_COUNT = '0'
+            env.STALE_LIST  = ''
           }
+        }
+      }
+    }
+
+    // ── 2b. Approve module ref updates ────────────────────────────────────
+    stage('Approve module updates') {
+      when {
+        allOf {
+          expression { params.UPDATE_MODULES }
+          expression { params.CHECK_MODULE_VERSIONS }
+          expression { (env.STALE_COUNT ?: '0').toInteger() > 0 }
+        }
+      }
+      steps {
+        script {
+          timeout(time: 1, unit: 'HOURS') {
+            env.UPDATE_APPROVED_BY = input(
+              message: """\
+Bump stale module refs to their latest versions?
+
+${env.STALE_LIST}
+
+This will edit the source refs in live/ and push a commit back to the repo.
+Subsequent stages will validate/plan/apply using the updated refs.
+""",
+              ok: 'Update ✓',
+              submitterParameter: 'UPDATE_APPROVED_BY'
+            )
+          }
+          echo "Approved by: ${env.UPDATE_APPROVED_BY ?: 'unknown'}"
+          env.DO_MODULE_UPDATE = 'true'
+        }
+      }
+    }
+
+    // ── 2c. Update module refs + commit back ──────────────────────────────
+    stage('Update module refs') {
+      when {
+        expression { env.DO_MODULE_UPDATE == 'true' }
+      }
+      steps {
+        script {
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo " Patching terragrunt.hcl files and pushing"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          withCredentials([usernamePassword(
+            credentialsId: params.GIT_CREDENTIALS_ID,
+            usernameVariable: 'GIT_USER',
+            passwordVariable: 'GIT_TOKEN'
+          )]) {
+            sh """#!/bin/bash
+              bash scripts/update_module_refs.sh \
+                '${env.UPDATES_FILE}' \
+                "https://\${GIT_USER}:\${GIT_TOKEN}@github.com/beravelli/autotfrefresh.git"
+            """
+          }
+          currentBuild.description = "✓ Module refs bumped to latest"
         }
       }
     }
@@ -132,7 +214,7 @@ pipeline {
     stage('Discover stacks') {
       steps {
         script {
-          sh "mkdir -p '${env.PLAN_DIR}'"
+          sh "mkdir -p '${env.PLAN_DIR}'"  // no-op if already created by check stage
 
           def raw = sh(
             script: """

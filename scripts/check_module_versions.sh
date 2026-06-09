@@ -22,6 +22,7 @@ set -euo pipefail
 
 MODULE_REPO_URL="${1:-https://github.com/beravelli/autotfrefresh.git}"
 ENV_FILTER="${2:-}"
+UPDATES_FILE="${3:-}"   # optional: write stale entries as TSV for downstream update step
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LIVE_ROOT="${SCRIPT_DIR}/../live"
@@ -68,6 +69,7 @@ get_latest_version() {
 STALE=0
 TOTAL=0
 ROWS=()
+STALE_ENTRIES=()   # machine-readable: stack|module|current|latest
 
 while IFS= read -r -d '' tg_file; do
   # Match lines like:
@@ -92,6 +94,7 @@ while IFS= read -r -d '' tg_file; do
   else
     status="⚠  BEHIND"
     STALE=$((STALE + 1))
+    STALE_ENTRIES+=("${stack_rel}|${module_name}|${full_ref}|${latest_ver}")
   fi
 
   ROWS+=("$(printf '%-38s %-8s %-10s %-10s %s' \
@@ -124,6 +127,11 @@ else
   echo "  gitops/refresh-pipeline  MODULE_NAME=<name>  MODULE_VERSION=<latest>"
 fi
 printf "\n"
+
+# ── Write machine-readable updates file (for downstream update step) ────────────
+if [[ -n "$UPDATES_FILE" && ${#STALE_ENTRIES[@]} -gt 0 ]]; then
+  printf '%s\n' "${STALE_ENTRIES[@]}" > "$UPDATES_FILE"
+fi
 
 # Exit code = number of stale stacks (0 = clean, >0 = drift detected)
 exit $STALE
