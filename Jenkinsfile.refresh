@@ -1,0 +1,248 @@
+// Live-Infra Refresh Pipeline
+//
+// Triggered by: gitops/module-tag-pipeline when a new module tag is pushed
+// Repo        : https://github.com/beravelli/autotfrefresh
+//
+// Flow:
+//   1. Find all terragrunt stacks referencing the updated module
+//   2. For each affected stack: validate (DRY_RUN) or plan (real AWS)
+//   3. Manual approval gate
+//   4. Apply each stack sequentially
+
+pipeline {
+  agent { label 'tofu' }
+
+  options {
+    timeout(time: 60, unit: 'MINUTES')
+    disableConcurrentBuilds()
+    buildDiscarder(logRotator(numToKeepStr: '30'))
+    ansiColor('xterm')
+  }
+
+  parameters {
+    string(name: 'MODULE_NAME',
+           defaultValue: '',
+           description: 'Module name, e.g. vpc | eks | rds')
+    string(name: 'MODULE_VERSION',
+           defaultValue: '',
+           description: 'Module version tag, e.g. v1.2.3')
+    string(name: 'MODULE_REPO_URL',
+           defaultValue: 'https://github.com/beravelli/autotfrefresh.git',
+           description: 'Module repo URL (monorepo)')
+    string(name: 'TRIGGERED_BY',
+           defaultValue: 'manual',
+           description: 'Who or what triggered this run')
+    booleanParam(name: 'DRY_RUN',
+           defaultValue: true,
+           description: 'true = tofu validate only (no AWS needed). false = real terragrunt plan.')
+    booleanParam(name: 'AUTO_APPROVE',
+           defaultValue: false,
+           description: 'Skip manual gate and auto-apply (use only in non-prod CI)')
+    string(name: 'ENV_FILTER',
+           defaultValue: '',
+           description: 'Limit to a specific env, e.g. dev or prod. Empty = all envs.')
+  }
+
+  environment {
+    LIVE_INFRA_REPO = 'https://github.com/beravelli/autotfrefresh.git'
+    PLAN_DIR        = "${WORKSPACE}/plans"
+    AFFECTED_FILE   = "${WORKSPACE}/affected_stacks.txt"
+  }
+
+  stages {
+    stage('Validate inputs') {
+      steps {
+        script {
+          if (!params.MODULE_NAME || !params.MODULE_VERSION || !params.MODULE_REPO_URL) {
+            error "MODULE_NAME, MODULE_VERSION and MODULE_REPO_URL are all required."
+          }
+          def mode = params.DRY_RUN ? 'DRY-RUN (validate only)' : 'REAL (terragrunt plan + apply)'
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo " Module  : ${params.MODULE_NAME}"
+          echo " Version : ${params.MODULE_VERSION}"
+          echo " Mode    : ${mode}"
+          echo " By      : ${params.TRIGGERED_BY}"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        }
+      }
+    }
+
+    stage('Find affected stacks') {
+      steps {
+        script {
+          sh "mkdir -p '${env.PLAN_DIR}'"
+
+          def filter   = params.ENV_FILTER?.trim() ?: ''
+          def exitCode = sh(
+            script: """
+              bash scripts/find_affected_stacks.sh \
+                "${params.MODULE_REPO_URL}" \
+                "${params.MODULE_NAME}" \
+                "${filter}" \
+                > "${env.AFFECTED_FILE}"
+            """,
+            returnStatus: true
+          )
+          if (exitCode != 0) {
+            error "find_affected_stacks.sh exited with code ${exitCode}"
+          }
+
+          def raw    = readFile(env.AFFECTED_FILE).trim()
+          def stacks = raw ? raw.split('\n').findAll { it.trim() } : []
+
+          if (!stacks) {
+            echo "No stacks reference module '${params.MODULE_NAME}' — nothing to do."
+            currentBuild.result = 'SUCCESS'
+            return
+          }
+
+          env.AFFECTED_STACKS_JSON = groovy.json.JsonOutput.toJson(stacks)
+          echo "Affected stacks (${stacks.size()}):"
+          stacks.each { echo "  • ${it}" }
+        }
+      }
+    }
+
+    stage('Plan / Validate stacks') {
+      when { expression { env.AFFECTED_STACKS_JSON && env.AFFECTED_STACKS_JSON != '[]' } }
+      steps {
+        script {
+          def stacks = readJSON(text: env.AFFECTED_STACKS_JSON)
+
+          if (params.DRY_RUN) {
+            // ── DRY-RUN: tofu validate only, no AWS needed ──────────────────
+            stacks.each { stackPath ->
+              def safeLabel = stackPath.replace('/', '__')
+              def logFile   = "${env.PLAN_DIR}/${safeLabel}.log"
+              echo "Validating (dry-run): ${stackPath}"
+              def rc = sh(
+                script: """
+                  bash scripts/tofu_plan.sh \
+                    "${stackPath}" \
+                    "${params.MODULE_REPO_URL}" \
+                    "${params.MODULE_NAME}" \
+                    "${params.MODULE_VERSION}" \
+                    "${env.PLAN_DIR}/${safeLabel}.tfplan" \
+                    true \
+                    2>&1 | tee "${logFile}"
+                  exit \${PIPESTATUS[0]}
+                """,
+                returnStatus: true
+              )
+              if (rc > 2) { unstable("Validation failed for ${stackPath}") }
+            }
+
+          } else {
+            // ── REAL: terragrunt plan with AWS credentials ──────────────────
+            withCredentials([[
+              $class: 'AmazonWebServicesCredentialsBinding',
+              credentialsId: 'aws-credentials'
+            ]]) {
+              stacks.each { stackPath ->
+                def safeLabel = stackPath.replace('/', '__')
+                def logFile   = "${env.PLAN_DIR}/${safeLabel}.log"
+                echo "Planning: ${stackPath}"
+                def rc = sh(
+                  script: """
+                    bash scripts/tofu_plan.sh \
+                      "${stackPath}" \
+                      "${params.MODULE_REPO_URL}" \
+                      "${params.MODULE_NAME}" \
+                      "${params.MODULE_VERSION}" \
+                      "${env.PLAN_DIR}/${safeLabel}.tfplan" \
+                      false \
+                      2>&1 | tee "${logFile}"
+                    exit \${PIPESTATUS[0]}
+                  """,
+                  returnStatus: true
+                )
+                // 0 = no changes, 2 = changes — both OK; anything else = error
+                if (rc != 0 && rc != 2) { unstable("Plan failed for ${stackPath}") }
+              }
+            }
+          }
+        }
+      }
+      post {
+        always { archiveArtifacts artifacts: 'plans/**/*.log', allowEmptyArchive: true }
+      }
+    }
+
+    stage('Approval') {
+      when {
+        allOf {
+          not { expression { params.AUTO_APPROVE } }
+          expression { env.AFFECTED_STACKS_JSON && env.AFFECTED_STACKS_JSON != '[]' }
+        }
+      }
+      steps {
+        script {
+          def stacks    = readJSON(text: env.AFFECTED_STACKS_JSON)
+          def stackList = stacks.collect { "  • ${it}" }.join('\n')
+          def modeNote  = params.DRY_RUN ? '\n⚠️  DRY-RUN: apply will also run validate only.' : ''
+
+          timeout(time: 24, unit: 'HOURS') {
+            input message: """\
+Module *${params.MODULE_NAME}* → *${params.MODULE_VERSION}*
+
+Affected stacks:
+${stackList}
+
+Review plan logs in the Artifacts tab above, then approve to apply.${modeNote}
+""",
+              ok: 'Apply ✓',
+              submitterParameter: 'APPROVED_BY'
+          }
+          echo "Approved by: ${env.APPROVED_BY ?: 'unknown'}"
+        }
+      }
+    }
+
+    stage('Apply stacks') {
+      when { expression { env.AFFECTED_STACKS_JSON && env.AFFECTED_STACKS_JSON != '[]' } }
+      steps {
+        script {
+          def stacks = readJSON(text: env.AFFECTED_STACKS_JSON)
+
+          if (params.DRY_RUN) {
+            echo "DRY-RUN mode: skipping real apply. Stacks validated successfully."
+            stacks.each { echo "  ✓ (would apply) ${it}" }
+          } else {
+            withCredentials([[
+              $class: 'AmazonWebServicesCredentialsBinding',
+              credentialsId: 'aws-credentials'
+            ]]) {
+              stacks.each { stackPath ->
+                def safeLabel = stackPath.replace('/', '__')
+                def planFile  = "${env.PLAN_DIR}/${safeLabel}.tfplan"
+                def logFile   = "${env.PLAN_DIR}/${safeLabel}.apply.log"
+                echo "Applying: ${stackPath}"
+                sh """
+                  bash scripts/tofu_apply.sh \
+                    "${stackPath}" \
+                    "${planFile}" \
+                    2>&1 | tee "${logFile}"
+                """
+              }
+            }
+          }
+        }
+      }
+      post {
+        always { archiveArtifacts artifacts: 'plans/**/*.apply.log', allowEmptyArchive: true }
+      }
+    }
+  }
+
+  post {
+    success {
+      echo "✓ Refresh complete: ${params.MODULE_NAME}@${params.MODULE_VERSION}"
+    }
+    failure {
+      echo "✗ Refresh pipeline failed — check stage logs and plan artifacts."
+    }
+    aborted {
+      echo "✗ Refresh aborted (approval denied or timed out)."
+    }
+  }
+}
