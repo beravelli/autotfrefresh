@@ -4,10 +4,12 @@
 // Repo        : https://github.com/beravelli/autotfrefresh
 //
 // Flow:
-//   1. Find all terragrunt stacks referencing the updated module
-//   2. For each affected stack: validate (DRY_RUN) or plan (real AWS)
-//   3. Manual approval gate
-//   4. Apply each stack sequentially
+//   1. Validate inputs
+//   2. Check whether MODULE_VERSION is the latest tag for the module (warn if not)
+//   3. Find all terragrunt stacks referencing the updated module
+//   4. For each affected stack: validate (DRY_RUN) or plan (real AWS)
+//   5. Manual approval gate  — version freshness warning included if applicable
+//   6. Apply each stack sequentially
 
 pipeline {
   agent { label 'tofu' }
@@ -63,6 +65,47 @@ pipeline {
           echo " Mode    : ${mode}"
           echo " By      : ${params.TRIGGERED_BY}"
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        }
+      }
+    }
+
+    stage('Check version') {
+      steps {
+        script {
+          // Find the highest semver tag for this module in the upstream repo.
+          // Works without credentials against a public repo.
+          def latestVersion = sh(
+            script: """
+              git ls-remote --tags '${params.MODULE_REPO_URL}' \
+                'refs/tags/${params.MODULE_NAME}/v*' 2>/dev/null \
+              | grep -v '\\^{}' \
+              | sed 's|.*refs/tags/${params.MODULE_NAME}/||' \
+              | sort -V \
+              | tail -1
+            """,
+            returnStdout: true
+          ).trim()
+
+          env.LATEST_VERSION = latestVersion ?: params.MODULE_VERSION
+
+          if (!latestVersion) {
+            echo "⚠ Could not determine latest tag for '${params.MODULE_NAME}' — skipping freshness check."
+            env.VERSION_WARN = ''
+
+          } else if (latestVersion == params.MODULE_VERSION) {
+            echo "✓ ${params.MODULE_NAME}@${params.MODULE_VERSION} is the latest available tag."
+            env.VERSION_WARN = ''
+
+          } else {
+            // Deploying something other than the latest — could be intentional (rollback)
+            env.VERSION_WARN = "⚠ Deploying ${params.MODULE_VERSION} but ${latestVersion} is available — only proceed if this is intentional (e.g. rollback)"
+            echo ""
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo " ${env.VERSION_WARN}"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            currentBuild.description = env.VERSION_WARN
+            // Non-fatal: operator may be rolling back intentionally
+          }
         }
       }
     }
@@ -177,13 +220,14 @@ pipeline {
       }
       steps {
         script {
-          def stacks    = readJSON(text: env.AFFECTED_STACKS_JSON)
-          def stackList = stacks.collect { "  • ${it}" }.join('\n')
-          def modeNote  = params.DRY_RUN ? '\n⚠️  DRY-RUN: apply will also run validate only.' : ''
+          def stacks      = readJSON(text: env.AFFECTED_STACKS_JSON)
+          def stackList   = stacks.collect { "  • ${it}" }.join('\n')
+          def versionNote = env.VERSION_WARN ? "\n\n${env.VERSION_WARN}" : ''
+          def modeNote    = params.DRY_RUN   ? '\n⚠️  DRY-RUN: apply will also run validate only.' : ''
 
           timeout(time: 24, unit: 'HOURS') {
             input message: """\
-Module *${params.MODULE_NAME}* → *${params.MODULE_VERSION}*
+Module *${params.MODULE_NAME}* → *${params.MODULE_VERSION}*${versionNote}
 
 Affected stacks:
 ${stackList}
@@ -236,7 +280,13 @@ Review plan logs in the Artifacts tab above, then approve to apply.${modeNote}
 
   post {
     success {
-      echo "✓ Refresh complete: ${params.MODULE_NAME}@${params.MODULE_VERSION}"
+      script {
+        def versionLine = env.VERSION_WARN
+          ? "⚠ Applied ${params.MODULE_NAME}@${params.MODULE_VERSION} (${env.LATEST_VERSION} is available)"
+          : "✓ Applied ${params.MODULE_NAME}@${params.MODULE_VERSION} (latest)"
+        echo versionLine
+        currentBuild.description = currentBuild.description ?: versionLine
+      }
     }
     failure {
       echo "✗ Refresh pipeline failed — check stage logs and plan artifacts."

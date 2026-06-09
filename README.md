@@ -21,21 +21,11 @@ git push origin vpc/v1.0.1
         ▼
 ┌──────────────────────────────┐
 │  refresh-pipeline            │  Parameterized Pipeline
-│  (Jenkinsfile.refresh)       │  • find_affected_stacks.sh → grep live/ for module ref
+│  (Jenkinsfile.refresh)       │  • git ls-remote → warn if not deploying latest tag
+│                              │  • find_affected_stacks.sh → grep live/ for module ref
 │                              │  • tofu validate (DRY_RUN) or terragrunt plan (real)
-│                              │  • manual approval gate (24 h timeout)
+│                              │  • manual approval gate — version warning included
 │                              │  └─▶ terragrunt apply each stack sequentially
-└──────────────────────────────┘
-
-        (daily cron, 08:00 UTC)
-        │
-        ▼
-┌──────────────────────────────┐
-│  drift-check                 │  Scheduled Pipeline
-│  (Jenkinsfile.check)         │  • check_module_versions.sh
-│                              │  • git ls-remote → latest tag per module
-│                              │  • compares live/ refs vs latest tags
-│                              │  • UNSTABLE + warning if any stack is behind
 └──────────────────────────────┘
 ```
 
@@ -54,8 +44,7 @@ git push origin vpc/v1.0.1
 ```
 autotfrefresh/
 ├── Jenkinsfile                     # Module tag trigger pipeline
-├── Jenkinsfile.refresh             # Live-infra refresh pipeline
-├── Jenkinsfile.check               # Scheduled version drift check
+├── Jenkinsfile.refresh             # Live-infra refresh pipeline (includes version check)
 ├── terragrunt.hcl                  # Root config (local backend for testing)
 │
 ├── modules/
@@ -141,25 +130,56 @@ Parameterized pipeline that applies module version bumps across all affected sta
 **Stages:**
 
 1. **Validate inputs** — guards against missing required params
-2. **Find affected stacks** — `scripts/find_affected_stacks.sh` greps `live/` for `git::…//modules/<name>` and returns only stacks referencing *this specific module*, not the whole monorepo
-3. **Plan / Validate stacks** — for each affected stack:
+2. **Check version** — calls `git ls-remote` to find the latest semver tag for `MODULE_NAME`; warns prominently if `MODULE_VERSION` is not the latest (non-fatal, to allow intentional rollbacks); sets `env.VERSION_WARN` for downstream stages
+3. **Find affected stacks** — `scripts/find_affected_stacks.sh` greps `live/` for `git::…//modules/<name>` and returns only stacks referencing *this specific module*, not the whole monorepo
+4. **Plan / Validate stacks** — for each affected stack:
    - `DRY_RUN=true`: patches the `ref=` in `terragrunt.hcl`, runs `tofu init -backend=false && tofu validate`, then restores the original file
    - `DRY_RUN=false`: full `terragrunt plan -detailed-exitcode` with AWS credentials (`aws-credentials` Jenkins credential)
    - Plan logs archived as build artifacts
-4. **Approval gate** — 24-hour `input` step showing the affected stack list; skipped if `AUTO_APPROVE=true`
-5. **Apply stacks** — sequential `terragrunt apply` per stack (or dry-run summary)
+5. **Approval gate** — 24-hour `input` step showing the affected stack list **and the version freshness warning** if applicable; skipped if `AUTO_APPROVE=true`
+6. **Apply stacks** — sequential `terragrunt apply` per stack (or dry-run summary)
 
 ---
 
 ## Version Drift Check
 
-`Jenkinsfile.check` runs `scripts/check_module_versions.sh` daily (and on demand) to warn you when live stacks are pinned to an old module version.
+Version staleness detection is built into `Jenkinsfile.refresh` — no separate job needed.
 
-### How it works
+### In-pipeline check (per run)
 
-1. Scans every `terragrunt.hcl` under `live/` and extracts the current `ref=` for each stack.
-2. Calls `git ls-remote --tags` against the upstream repo to find the highest semver tag for each module (one network call per unique module name, cached).
-3. Compares `current` vs `latest` and prints a table:
+Every time `refresh-pipeline` runs, the **Check version** stage calls `git ls-remote` to find the latest semver tag for `MODULE_NAME` and compares it against `MODULE_VERSION`. If you're deploying something older than the latest:
+
+- A warning banner is printed in the build log
+- The build description is set to the warning
+- The **approval gate** message includes the warning so the reviewer sees it before clicking approve:
+
+```
+Module *vpc* → *v1.0.0*
+
+⚠ Deploying v1.0.0 but v1.0.1 is available — only proceed if this is intentional (e.g. rollback)
+
+Affected stacks:
+  • prod/us-east-1/vpc
+  • dev/us-east-1/vpc
+
+Review plan logs in the Artifacts tab above, then approve to apply.
+```
+
+The check is **non-fatal** — operators may intentionally deploy an older version (rollback).
+
+### Full drift scan (any time)
+
+To check all stacks at once, run the script directly or via the Jenkins pipeline:
+
+```bash
+# Check all envs
+bash scripts/check_module_versions.sh
+
+# Check only prod
+bash scripts/check_module_versions.sh https://github.com/beravelli/autotfrefresh.git prod
+```
+
+Example output:
 
 ```
 Stack                                  Module   Current    Latest     Status
@@ -174,32 +194,7 @@ prod/us-east-1/vpc                     vpc      v1.0.0     v1.0.1     ⚠  BEHIN
 ⚠  2/6 stack(s) are behind the latest module tags.
 ```
 
-4. Sets the Jenkins build to **UNSTABLE** if any stack is behind, with a description like `⚠ 2 stack(s) behind latest module tags — see log`.
-5. Prints the command to run the refresh pipeline to close the gap.
-
-### Running locally
-
-```bash
-# Check all envs
-bash scripts/check_module_versions.sh
-
-# Check only prod
-bash scripts/check_module_versions.sh https://github.com/beravelli/autotfrefresh.git prod
-
-# Exit code = number of stale stacks (0 = clean, can be used in CI gates)
-echo "Stale stacks: $?"
-```
-
-### Closing the gap
-
-When the drift-check reports stale stacks, trigger the refresh pipeline for the module:
-
-```
-gitops/refresh-pipeline
-  MODULE_NAME    = vpc
-  MODULE_VERSION = v1.0.1   ← the "Latest" value from the drift report
-  DRY_RUN        = true     ← preview first
-```
+Exit code equals the number of stale stacks (`0` = clean). To close a gap, trigger `refresh-pipeline` with the latest version shown in the report.
 
 ---
 
@@ -299,7 +294,6 @@ remote_state {
 |-----|------|-------------|---------|
 | `gitops/module-tag-pipeline` | Multibranch Pipeline | `Jenkinsfile` | Tag push |
 | `gitops/refresh-pipeline` | Pipeline | `Jenkinsfile.refresh` | Downstream / manual |
-| `gitops/drift-check` | Pipeline | `Jenkinsfile.check` | Daily cron 08:00 UTC / manual |
 
 **module-tag-pipeline** config highlights:
 - SCM: `GitHubSCMSource` pointing at `beravelli/autotfrefresh`
