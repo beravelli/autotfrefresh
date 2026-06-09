@@ -197,15 +197,17 @@ Subsequent stages will validate/plan/apply using the updated refs.
           sh """#!/bin/bash
             bash scripts/update_module_refs.sh '${env.UPDATES_FILE}'
           """
-          // Push using Jenkins credential helper — avoids embedding token in URL
-          withCredentials([gitUsernamePassword(
+          // Push — Jenkins masks GIT_TOKEN in logs automatically
+          withCredentials([usernamePassword(
             credentialsId: params.GIT_CREDENTIALS_ID,
-            gitToolName: 'Default'
+            usernameVariable: 'GIT_USER',
+            passwordVariable: 'GIT_TOKEN'
           )]) {
             sh """#!/bin/bash
+              set -euo pipefail
               BRANCH=\$(git rev-parse --abbrev-ref HEAD)
-              git push origin "HEAD:\${BRANCH}"
-              echo "✓ Pushed to \${BRANCH}"
+              git push "https://\${GIT_USER}:\${GIT_TOKEN}@github.com/beravelli/autotfrefresh.git" "HEAD:\${BRANCH}"
+              echo "✓ Pushed module ref updates to \${BRANCH}"
             """
           }
           currentBuild.description = "✓ Module refs bumped to latest"
