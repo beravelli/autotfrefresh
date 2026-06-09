@@ -177,7 +177,7 @@ pipeline {
             def logFile = "${env.PLAN_DIR}/${safe}.log"
             echo "Validating: ${stackPath}"
             def rc = sh(
-              script: """
+              script: """#!/bin/bash
                 bash scripts/stack_action.sh \
                   '${stackPath}' validate \
                   2>&1 | tee '${logFile}'
@@ -224,7 +224,7 @@ pipeline {
               def planFile = "${env.PLAN_DIR}/${safe}.tfplan"
               echo "Planning: ${stackPath}"
               def rc = sh(
-                script: """
+                script: """#!/bin/bash
                   bash scripts/stack_action.sh \
                     '${stackPath}' plan '${planFile}' \
                     2>&1 | tee '${logFile}'

@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # stack_action.sh — run validate / plan / apply on a live stack
+# Ensure tofu / terragrunt are found regardless of how this script is invoked
+export PATH="/var/jenkins_home/bin:${PATH}"
 #
 # Usage:
 #   stack_action.sh <stack_path> <action> [plan_file]
