@@ -127,8 +127,8 @@ pipeline {
             returnStatus: true
           )
           if (rc > 0) {
-            env.DRIFT_WARN  = "⚠ ${rc} stack(s) are behind their latest module tag — review before applying"
-            env.STALE_COUNT = "${rc}"
+            env.DRIFT_WARN = "⚠ ${rc} stack(s) are behind their latest module tag — review before applying"
+            env.HAS_STALE  = 'true'   // simple flag — avoids toInteger() sandbox issue
             // Build a human-readable list for the approval message
             env.STALE_LIST = sh(
               script: """
@@ -145,9 +145,9 @@ pipeline {
             // Non-fatal — operator may intend to apply without bumping module versions
           } else {
             echo "✓ All stacks are on the latest module tags."
-            env.DRIFT_WARN  = ''
-            env.STALE_COUNT = '0'
-            env.STALE_LIST  = ''
+            env.DRIFT_WARN = ''
+            env.HAS_STALE  = 'false'
+            env.STALE_LIST = ''
           }
         }
       }
@@ -157,9 +157,8 @@ pipeline {
     stage('Approve module updates') {
       when {
         allOf {
-          expression { params.UPDATE_MODULES }
-          expression { params.CHECK_MODULE_VERSIONS }
-          expression { (env.STALE_COUNT ?: '0').toInteger() > 0 }
+          expression { params.UPDATE_MODULES == true }
+          expression { env.HAS_STALE == 'true' }
         }
       }
       steps {
