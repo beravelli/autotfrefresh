@@ -193,15 +193,19 @@ Subsequent stages will validate/plan/apply using the updated refs.
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           echo " Patching terragrunt.hcl files and pushing"
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          withCredentials([usernamePassword(
+          // Patch files and commit (script does not push)
+          sh """#!/bin/bash
+            bash scripts/update_module_refs.sh '${env.UPDATES_FILE}'
+          """
+          // Push using Jenkins credential helper — avoids embedding token in URL
+          withCredentials([gitUsernamePassword(
             credentialsId: params.GIT_CREDENTIALS_ID,
-            usernameVariable: 'GIT_USER',
-            passwordVariable: 'GIT_TOKEN'
+            gitToolName: 'Default'
           )]) {
             sh """#!/bin/bash
-              bash scripts/update_module_refs.sh \
-                '${env.UPDATES_FILE}' \
-                "https://\${GIT_USER}:\${GIT_TOKEN}@github.com/beravelli/autotfrefresh.git"
+              BRANCH=\$(git rev-parse --abbrev-ref HEAD)
+              git push origin "HEAD:\${BRANCH}"
+              echo "✓ Pushed to \${BRANCH}"
             """
           }
           currentBuild.description = "✓ Module refs bumped to latest"

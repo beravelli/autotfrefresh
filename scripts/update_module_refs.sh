@@ -1,27 +1,28 @@
 #!/usr/bin/env bash
-# update_module_refs.sh — bump stale module source refs in live/ terragrunt stacks
+# update_module_refs.sh — patch stale module source refs in live/ terragrunt stacks
 #
 # Usage:
-#   update_module_refs.sh <updates_file> [git_remote_url]
+#   update_module_refs.sh <updates_file>
 #
 # Arguments:
 #   updates_file    path to TSV produced by check_module_versions.sh:
 #                   <stack_path>|<module>|<current_version>|<latest_version>
-#   git_remote_url  (optional) HTTPS remote with embedded credentials for push;
-#                   if omitted the existing 'origin' remote is used as-is.
 #
-# Environment variables (consumed by git push):
+# What this script does:
+#   - Patches each stale terragrunt.hcl in-place (sed on the ?ref= line)
+#   - git add + git commit (does NOT push — the caller handles push with credentials)
+#
+# Environment variables:
 #   GIT_AUTHOR_NAME    defaults to "Jenkins"
 #   GIT_AUTHOR_EMAIL   defaults to "jenkins@ci.local"
 #
 # Exit codes:
-#   0  success
+#   0  success (files patched and committed, or nothing to do)
 #   1  error
 
 set -euo pipefail
 
 UPDATES_FILE="${1:?updates_file required}"
-GIT_REMOTE_URL="${2:-}"
 
 export GIT_AUTHOR_NAME="${GIT_AUTHOR_NAME:-Jenkins}"
 export GIT_AUTHOR_EMAIL="${GIT_AUTHOR_EMAIL:-jenkins@ci.local}"
@@ -82,13 +83,5 @@ done < "$UPDATES_FILE"
 
 git commit -m "$(printf 'chore: bump module refs to latest versions\n\n%b\n[skip ci]' "$COMMIT_BODY")"
 
-if [[ -n "$GIT_REMOTE_URL" ]]; then
-  git remote set-url origin "$GIT_REMOTE_URL"
-fi
-
-# Push to the current branch (HEAD)
-CURRENT_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
-git push origin "HEAD:${CURRENT_BRANCH}"
-
 echo ""
-echo "✓ Module refs committed and pushed (branch: ${CURRENT_BRANCH})"
+echo "✓ Module refs committed — caller will push with credentials."
