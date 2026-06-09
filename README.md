@@ -26,6 +26,17 @@ git push origin vpc/v1.0.1
 │                              │  • manual approval gate (24 h timeout)
 │                              │  └─▶ terragrunt apply each stack sequentially
 └──────────────────────────────┘
+
+        (daily cron, 08:00 UTC)
+        │
+        ▼
+┌──────────────────────────────┐
+│  drift-check                 │  Scheduled Pipeline
+│  (Jenkinsfile.check)         │  • check_module_versions.sh
+│                              │  • git ls-remote → latest tag per module
+│                              │  • compares live/ refs vs latest tags
+│                              │  • UNSTABLE + warning if any stack is behind
+└──────────────────────────────┘
 ```
 
 ### Toolchain
@@ -44,6 +55,7 @@ git push origin vpc/v1.0.1
 autotfrefresh/
 ├── Jenkinsfile                     # Module tag trigger pipeline
 ├── Jenkinsfile.refresh             # Live-infra refresh pipeline
+├── Jenkinsfile.check               # Scheduled version drift check
 ├── terragrunt.hcl                  # Root config (local backend for testing)
 │
 ├── modules/
@@ -73,7 +85,8 @@ autotfrefresh/
 └── scripts/
     ├── find_affected_stacks.sh     # Scans live/ for stacks using the updated module
     ├── tofu_plan.sh                # Patches ref, runs validate (DRY_RUN) or plan
-    └── tofu_apply.sh               # Runs terragrunt apply with saved plan file
+    ├── tofu_apply.sh               # Runs terragrunt apply with saved plan file
+    └── check_module_versions.sh    # Compares live/ refs vs latest tags (drift check)
 ```
 
 ---
@@ -138,6 +151,58 @@ Parameterized pipeline that applies module version bumps across all affected sta
 
 ---
 
+## Version Drift Check
+
+`Jenkinsfile.check` runs `scripts/check_module_versions.sh` daily (and on demand) to warn you when live stacks are pinned to an old module version.
+
+### How it works
+
+1. Scans every `terragrunt.hcl` under `live/` and extracts the current `ref=` for each stack.
+2. Calls `git ls-remote --tags` against the upstream repo to find the highest semver tag for each module (one network call per unique module name, cached).
+3. Compares `current` vs `latest` and prints a table:
+
+```
+Stack                                  Module   Current    Latest     Status
+────────────────────────────────────── ──────── ────────── ────────── ──────────────
+dev/us-east-1/eks                      eks      v1.0.0     v1.0.0     ✓ up to date
+dev/us-east-1/rds                      rds      v1.0.0     v1.0.0     ✓ up to date
+dev/us-east-1/vpc                      vpc      v1.0.0     v1.0.1     ⚠  BEHIND
+prod/us-east-1/eks                     eks      v1.0.0     v1.0.0     ✓ up to date
+prod/us-east-1/rds                     rds      v1.0.0     v1.0.0     ✓ up to date
+prod/us-east-1/vpc                     vpc      v1.0.0     v1.0.1     ⚠  BEHIND
+
+⚠  2/6 stack(s) are behind the latest module tags.
+```
+
+4. Sets the Jenkins build to **UNSTABLE** if any stack is behind, with a description like `⚠ 2 stack(s) behind latest module tags — see log`.
+5. Prints the command to run the refresh pipeline to close the gap.
+
+### Running locally
+
+```bash
+# Check all envs
+bash scripts/check_module_versions.sh
+
+# Check only prod
+bash scripts/check_module_versions.sh https://github.com/beravelli/autotfrefresh.git prod
+
+# Exit code = number of stale stacks (0 = clean, can be used in CI gates)
+echo "Stale stacks: $?"
+```
+
+### Closing the gap
+
+When the drift-check reports stale stacks, trigger the refresh pipeline for the module:
+
+```
+gitops/refresh-pipeline
+  MODULE_NAME    = vpc
+  MODULE_VERSION = v1.0.1   ← the "Latest" value from the drift report
+  DRY_RUN        = true     ← preview first
+```
+
+---
+
 ## Scripts
 
 ### `scripts/find_affected_stacks.sh`
@@ -181,6 +246,21 @@ Runs `terragrunt apply --terragrunt-non-interactive <plan_file>` from the stack 
 
 ---
 
+### `scripts/check_module_versions.sh`
+
+```
+Usage: check_module_versions.sh [module_repo_url] [env_filter]
+```
+
+For each `terragrunt.hcl` in `live/`:
+1. Parses the `source = "git::…?ref=<module>/<version>"` line to extract module name and pinned version.
+2. Calls `git ls-remote --tags <repo> refs/tags/<module>/v*`, sorts by semver (`sort -V`), and takes the highest.
+3. Tags per unique module name are cached in a temp dir — only one network call per module regardless of how many stacks use it.
+
+Exit code equals the number of stale stacks (0 = all up to date). Works on Bash 3 (macOS) and Bash 4+ (Linux / Jenkins).
+
+---
+
 ## Backend
 
 The root `terragrunt.hcl` uses a **local** backend for testing — no S3 bucket or DynamoDB table required:
@@ -215,10 +295,11 @@ remote_state {
 
 ### Jenkins Jobs
 
-| Job | Type | Script path |
-|-----|------|-------------|
-| `gitops/module-tag-pipeline` | Multibranch Pipeline | `Jenkinsfile` |
-| `gitops/refresh-pipeline` | Pipeline | `Jenkinsfile.refresh` |
+| Job | Type | Script path | Trigger |
+|-----|------|-------------|---------|
+| `gitops/module-tag-pipeline` | Multibranch Pipeline | `Jenkinsfile` | Tag push |
+| `gitops/refresh-pipeline` | Pipeline | `Jenkinsfile.refresh` | Downstream / manual |
+| `gitops/drift-check` | Pipeline | `Jenkinsfile.check` | Daily cron 08:00 UTC / manual |
 
 **module-tag-pipeline** config highlights:
 - SCM: `GitHubSCMSource` pointing at `beravelli/autotfrefresh`
