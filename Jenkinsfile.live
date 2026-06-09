@@ -1,0 +1,333 @@
+// Live-Infra Direct Action Pipeline
+//
+// Use this pipeline to validate, plan, or apply terragrunt stacks directly —
+// without needing a module version bump to trigger it.
+//
+// Flexible targeting:
+//   • All stacks             — leave all filters empty
+//   • By environment         — set ENV_FILTER=dev
+//   • By region              — set REGION_FILTER=us-east-1
+//   • By module              — set MODULE_FILTER=vpc
+//   • Exact stack            — set STACK_FILTER=dev/us-east-1/vpc  (overrides other filters)
+//   • Combine any of the above
+//
+// Flow:
+//   1. Validate inputs — summarise targeting + action
+//   2. Check module versions (optional) — warn if stacks are behind latest tags
+//   3. Discover stacks — find all terragrunt stacks matching the filters
+//   4a. Validate   (ACTION=validate) — tofu init -backend=false && tofu validate
+//   4b. Plan       (ACTION=plan)     — terragrunt plan with real AWS credentials
+//   4c. Plan       (ACTION=apply)    — same as above, output saved for apply step
+//   5. Approval gate (ACTION=apply only, unless AUTO_APPROVE=true)
+//   6. Apply        (ACTION=apply)   — terragrunt apply from saved plan
+
+pipeline {
+  agent { label 'tofu' }
+
+  options {
+    timeout(time: 90, unit: 'MINUTES')
+    disableConcurrentBuilds()
+    buildDiscarder(logRotator(numToKeepStr: '30'))
+    ansiColor('xterm')
+  }
+
+  parameters {
+    choice(
+      name: 'ACTION',
+      choices: ['validate', 'plan', 'apply'],
+      description: 'validate = tofu validate only (no AWS). plan = terragrunt plan. apply = plan then apply.'
+    )
+    string(
+      name: 'ENV_FILTER',
+      defaultValue: '',
+      description: 'Limit to an environment, e.g. dev | prod. Empty = all.'
+    )
+    string(
+      name: 'REGION_FILTER',
+      defaultValue: '',
+      description: 'Limit to a region, e.g. us-east-1. Empty = all.'
+    )
+    string(
+      name: 'MODULE_FILTER',
+      defaultValue: '',
+      description: 'Limit to a module, e.g. vpc | eks | rds. Empty = all.'
+    )
+    string(
+      name: 'STACK_FILTER',
+      defaultValue: '',
+      description: 'Target one exact stack, e.g. dev/us-east-1/vpc. Overrides all other filters.'
+    )
+    booleanParam(
+      name: 'CHECK_MODULE_VERSIONS',
+      defaultValue: true,
+      description: 'Warn if any targeted stacks are behind their latest module tag before acting.'
+    )
+    booleanParam(
+      name: 'AUTO_APPROVE',
+      defaultValue: false,
+      description: 'Skip the manual approval gate (apply only). Use only in non-prod CI.'
+    )
+    string(
+      name: 'MODULE_REPO_URL',
+      defaultValue: 'https://github.com/beravelli/autotfrefresh.git',
+      description: 'Repo URL used for module version drift check.'
+    )
+  }
+
+  environment {
+    PLAN_DIR = "${WORKSPACE}/plans"
+  }
+
+  stages {
+
+    // ── 1. Validate inputs ─────────────────────────────────────────────────
+    stage('Validate inputs') {
+      steps {
+        script {
+          def target = params.STACK_FILTER?.trim()
+            ?: [params.ENV_FILTER, params.REGION_FILTER, params.MODULE_FILTER]
+                 .findAll { it?.trim() }
+                 .join('/') ?: 'ALL stacks'
+
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo " Action : ${params.ACTION.toUpperCase()}"
+          echo " Target : ${target}"
+          echo " Drift? : ${params.CHECK_MODULE_VERSIONS}"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        }
+      }
+    }
+
+    // ── 2. Check module version drift ─────────────────────────────────────
+    stage('Check module versions') {
+      when { expression { params.CHECK_MODULE_VERSIONS } }
+      steps {
+        script {
+          def envArg = params.ENV_FILTER?.trim() ?: ''
+          def rc = sh(
+            script: """
+              bash scripts/check_module_versions.sh \
+                '${params.MODULE_REPO_URL}' \
+                '${envArg}'
+            """,
+            returnStatus: true
+          )
+          if (rc > 0) {
+            env.DRIFT_WARN = "⚠ ${rc} stack(s) are behind their latest module tag — review before applying"
+            echo ""
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo " ${env.DRIFT_WARN}"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            currentBuild.description = env.DRIFT_WARN
+            // Non-fatal — operator may intend to apply without bumping module versions
+          } else {
+            echo "✓ All stacks are on the latest module tags."
+            env.DRIFT_WARN = ''
+          }
+        }
+      }
+    }
+
+    // ── 3. Discover stacks ─────────────────────────────────────────────────
+    stage('Discover stacks') {
+      steps {
+        script {
+          sh "mkdir -p '${env.PLAN_DIR}'"
+
+          def raw = sh(
+            script: """
+              bash scripts/discover_stacks.sh \
+                '${params.ENV_FILTER?.trim()    ?: ''}' \
+                '${params.REGION_FILTER?.trim() ?: ''}' \
+                '${params.MODULE_FILTER?.trim() ?: ''}' \
+                '${params.STACK_FILTER?.trim()  ?: ''}'
+            """,
+            returnStdout: true
+          ).trim()
+
+          def stacks = raw ? raw.split('\n').findAll { it.trim() && !it.startsWith('No stacks') } : []
+
+          if (!stacks) {
+            echo "No stacks matched the given filters — nothing to do."
+            currentBuild.result = 'SUCCESS'
+            return
+          }
+
+          env.STACKS_JSON = groovy.json.JsonOutput.toJson(stacks)
+          echo "Discovered ${stacks.size()} stack(s):"
+          stacks.each { echo "  • ${it}" }
+        }
+      }
+    }
+
+    // ── 4a. Validate ───────────────────────────────────────────────────────
+    stage('Validate stacks') {
+      when {
+        allOf {
+          expression { params.ACTION == 'validate' }
+          expression { env.STACKS_JSON && env.STACKS_JSON != '[]' }
+        }
+      }
+      steps {
+        script {
+          def stacks = readJSON(text: env.STACKS_JSON)
+          def failed = []
+          stacks.each { stackPath ->
+            def safe    = stackPath.replace('/', '__')
+            def logFile = "${env.PLAN_DIR}/${safe}.log"
+            echo "Validating: ${stackPath}"
+            def rc = sh(
+              script: """
+                bash scripts/stack_action.sh \
+                  '${stackPath}' validate \
+                  2>&1 | tee '${logFile}'
+                exit \${PIPESTATUS[0]}
+              """,
+              returnStatus: true
+            )
+            if (rc != 0) {
+              echo "✗ Validation FAILED for ${stackPath}"
+              failed << stackPath
+            }
+          }
+          if (failed) {
+            unstable("Validation failed for: ${failed.join(', ')}")
+          } else {
+            echo "✓ All ${stacks.size()} stack(s) validated successfully."
+          }
+        }
+      }
+      post {
+        always { archiveArtifacts artifacts: 'plans/**/*.log', allowEmptyArchive: true }
+      }
+    }
+
+    // ── 4b/c. Plan (for plan or apply actions) ────────────────────────────
+    stage('Plan stacks') {
+      when {
+        allOf {
+          expression { params.ACTION in ['plan', 'apply'] }
+          expression { env.STACKS_JSON && env.STACKS_JSON != '[]' }
+        }
+      }
+      steps {
+        script {
+          def stacks = readJSON(text: env.STACKS_JSON)
+          def failed = []
+          withCredentials([[
+            $class: 'AmazonWebServicesCredentialsBinding',
+            credentialsId: 'aws-credentials'
+          ]]) {
+            stacks.each { stackPath ->
+              def safe     = stackPath.replace('/', '__')
+              def logFile  = "${env.PLAN_DIR}/${safe}.plan.log"
+              def planFile = "${env.PLAN_DIR}/${safe}.tfplan"
+              echo "Planning: ${stackPath}"
+              def rc = sh(
+                script: """
+                  bash scripts/stack_action.sh \
+                    '${stackPath}' plan '${planFile}' \
+                    2>&1 | tee '${logFile}'
+                  exit \${PIPESTATUS[0]}
+                """,
+                returnStatus: true
+              )
+              // 0 = no changes, 2 = changes present — both valid plan outcomes
+              if (rc != 0 && rc != 2) {
+                echo "✗ Plan FAILED for ${stackPath} (exit ${rc})"
+                failed << stackPath
+              }
+            }
+          }
+          if (failed) {
+            unstable("Plan failed for: ${failed.join(', ')}")
+          }
+        }
+      }
+      post {
+        always { archiveArtifacts artifacts: 'plans/**/*.plan.log', allowEmptyArchive: true }
+      }
+    }
+
+    // ── 5. Approval gate ──────────────────────────────────────────────────
+    stage('Approval') {
+      when {
+        allOf {
+          expression { params.ACTION == 'apply' }
+          not { expression { params.AUTO_APPROVE } }
+          expression { env.STACKS_JSON && env.STACKS_JSON != '[]' }
+        }
+      }
+      steps {
+        script {
+          def stacks    = readJSON(text: env.STACKS_JSON)
+          def stackList = stacks.collect { "  • ${it}" }.join('\n')
+          def driftNote = env.DRIFT_WARN ? "\n\n${env.DRIFT_WARN}" : ''
+
+          timeout(time: 24, unit: 'HOURS') {
+            input message: """\
+Action: *APPLY*${driftNote}
+
+Stacks to apply:
+${stackList}
+
+Review plan logs in the Artifacts tab above, then approve to apply.
+""",
+              ok: 'Apply ✓',
+              submitterParameter: 'APPROVED_BY'
+          }
+          echo "Approved by: ${env.APPROVED_BY ?: 'unknown'}"
+        }
+      }
+    }
+
+    // ── 6. Apply ──────────────────────────────────────────────────────────
+    stage('Apply stacks') {
+      when {
+        allOf {
+          expression { params.ACTION == 'apply' }
+          expression { env.STACKS_JSON && env.STACKS_JSON != '[]' }
+        }
+      }
+      steps {
+        script {
+          def stacks = readJSON(text: env.STACKS_JSON)
+          withCredentials([[
+            $class: 'AmazonWebServicesCredentialsBinding',
+            credentialsId: 'aws-credentials'
+          ]]) {
+            stacks.each { stackPath ->
+              def safe     = stackPath.replace('/', '__')
+              def planFile = "${env.PLAN_DIR}/${safe}.tfplan"
+              def logFile  = "${env.PLAN_DIR}/${safe}.apply.log"
+              echo "Applying: ${stackPath}"
+              sh """
+                bash scripts/stack_action.sh \
+                  '${stackPath}' apply '${planFile}' \
+                  2>&1 | tee '${logFile}'
+              """
+            }
+          }
+        }
+      }
+      post {
+        always { archiveArtifacts artifacts: 'plans/**/*.apply.log', allowEmptyArchive: true }
+      }
+    }
+
+  } // end stages
+
+  post {
+    success {
+      script {
+        def stacks    = env.STACKS_JSON ? readJSON(text: env.STACKS_JSON) : []
+        def driftSufx = env.DRIFT_WARN  ? ' (drift detected)' : ''
+        def desc      = "✓ ${params.ACTION.toUpperCase()} — ${stacks.size()} stack(s)${driftSufx}"
+        echo desc
+        currentBuild.description = currentBuild.description ?: desc
+      }
+    }
+    failure { echo "✗ Live-infra pipeline failed — check stage logs and plan artifacts." }
+    aborted { echo "✗ Live-infra pipeline aborted." }
+  }
+}
