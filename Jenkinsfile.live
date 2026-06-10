@@ -67,11 +67,6 @@ pipeline {
       defaultValue: false,
       description: 'Skip the manual approval gate (apply only). Use only in non-prod CI.'
     )
-    string(
-      name: 'MODULE_REPO_URL',
-      defaultValue: 'https://github.com/beravelli/autotfrefresh.git',
-      description: 'Repo URL used for module version drift check.'
-    )
     booleanParam(
       name: 'UPDATE_MODULES',
       defaultValue: false,
@@ -120,7 +115,6 @@ pipeline {
           def rc = sh(
             script: """
               bash scripts/check_module_versions.sh \
-                '${params.MODULE_REPO_URL}' \
                 '${envArg}' \
                 '${env.UPDATES_FILE}'
             """,

@@ -5,7 +5,7 @@ include "root" {
 terraform {
   # Source: monorepo subdirectory. Tag format: vpc/v<semver>
   # The refresh pipeline patches this ref when a new vpc tag is pushed.
-  source = "git::https://github.com/beravelli/autotfrefresh.git//modules/vpc?ref=vpc/v1.0.0"
+  source = "git::https://github.com/beravelli/tf-module-vpc.git?ref=v1.0.0"
 }
 
 inputs = {

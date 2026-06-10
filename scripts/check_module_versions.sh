@@ -1,28 +1,34 @@
 #!/usr/bin/env bash
 # check_module_versions.sh
 #
-# Scans every live/ terragrunt stack and reports which module refs
-# are behind the latest git tag in the upstream repo.
+# Scans every live/ terragrunt stack and reports which module refs are
+# behind the latest git tag.  Works with BOTH layouts:
+#
+#   Multi-repo  (one repo per module, tags: v1.0.0)
+#     source = "git::https://github.com/org/tf-module-vpc.git?ref=v1.0.0"
+#
+#   Monorepo    (all modules in one repo, tags: vpc/v1.0.0)
+#     source = "git::https://github.com/org/infra.git//modules/vpc?ref=vpc/v1.0.0"
+#
+# The repo URL, module name and tag format are ALL read from the source
+# line in each terragrunt.hcl — no hardcoded repo URL needed.
 #
 # Usage:
-#   check_module_versions.sh [module_repo_url] [env_filter]
+#   check_module_versions.sh [env_filter] [updates_file]
 #
 # Args:
-#   module_repo_url – defaults to https://github.com/beravelli/autotfrefresh.git
-#   env_filter      – optional; restrict to a specific env dir (e.g. dev or prod)
-#
-# Output:
-#   Table to stdout showing Current vs Latest for each stack.
+#   env_filter    optional; restrict to a specific env dir (e.g. dev or prod)
+#   updates_file  optional; path to write stale entries as pipe-delimited TSV:
+#                 <stack_path>|<module_name>|<current_ref>|<latest_ref>
 #
 # Exit code:
-#   0 – all stacks up to date
-#   N – number of stacks behind (so Jenkins can set UNSTABLE on N > 0)
+#   0  all stacks up to date
+#   N  number of stacks behind
 
 set -euo pipefail
 
-MODULE_REPO_URL="${1:-https://github.com/beravelli/autotfrefresh.git}"
-ENV_FILTER="${2:-}"
-UPDATES_FILE="${3:-}"   # optional: write stale entries as TSV for downstream update step
+ENV_FILTER="${1:-}"
+UPDATES_FILE="${2:-}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LIVE_ROOT="${SCRIPT_DIR}/../live"
@@ -41,23 +47,28 @@ if [[ -n "$ENV_FILTER" ]]; then
   fi
 fi
 
-# ── Tag cache: avoids one git ls-remote per stack for the same module ──────────
-# Uses a temp dir so it works on Bash 3 (macOS) and Bash 4+ (Linux/Jenkins)
+# ── Tag cache: keyed by "repo_url|tag_prefix" to avoid redundant ls-remote ──
 CACHE_DIR=$(mktemp -d)
 trap 'rm -rf "$CACHE_DIR"' EXIT
 
 get_latest_version() {
-  local module="$1"
-  local cache_file="${CACHE_DIR}/${module}"
+  local repo_url="$1"
+  local tag_prefix="$2"   # e.g. "vpc/" for monorepo, "" for multi-repo
+
+  local cache_key
+  cache_key=$(printf '%s|%s' "$repo_url" "$tag_prefix" | md5 -q 2>/dev/null \
+              || printf '%s|%s' "$repo_url" "$tag_prefix" | md5sum | cut -d' ' -f1)
+  local cache_file="${CACHE_DIR}/${cache_key}"
+
   if [[ -f "$cache_file" ]]; then
     cat "$cache_file"
     return
   fi
-  # List all vX.Y.Z tags for this module, sort by semver, take the highest
+
   local latest
-  latest=$(git ls-remote --tags "$MODULE_REPO_URL" "refs/tags/${module}/v*" 2>/dev/null \
+  latest=$(git ls-remote --tags "$repo_url" "refs/tags/${tag_prefix}v*" 2>/dev/null \
     | grep -v '\^{}' \
-    | sed "s|.*refs/tags/${module}/||" \
+    | sed "s|.*refs/tags/${tag_prefix}||" \
     | sort -V \
     | tail -1)
   latest="${latest:-unknown}"
@@ -65,44 +76,87 @@ get_latest_version() {
   echo "$latest"
 }
 
-# ── Scan ───────────────────────────────────────────────────────────────────────
+# ── Scan ──────────────────────────────────────────────────────────────────────
 STALE=0
 TOTAL=0
 ROWS=()
-STALE_ENTRIES=()   # machine-readable: stack|module|current|latest
+STALE_ENTRIES=()
 
 while IFS= read -r -d '' tg_file; do
-  # Match lines like:
-  #   source = "git::https://…//modules/vpc?ref=vpc/v1.0.0"
-  source_line=$(grep -oE 'git::[^"]+//modules/[^"]+\?ref=[^"]+' "$tg_file" 2>/dev/null || true)
+  # Match: git::https://...?ref=...
+  source_line=$(grep -oE 'git::[^"]+\?ref=[^"]+' "$tg_file" 2>/dev/null || true)
   [[ -z "$source_line" ]] && continue
 
-  module_name=$(echo "$source_line" | sed -n 's|.*//modules/\([^?]*\).*|\1|p')
-  full_ref=$(echo "$source_line"    | sed -n 's|.*?ref=[^/]*/\(v[^"'"'"' ]*\).*|\1|p')
+  # ── Parse repo URL ─────────────────────────────────────────────────────────
+  # Strip git:: prefix, isolate the URL before any ?
+  raw_url="${source_line#git::}"
+  url_part="${raw_url%%\?*}"
 
-  [[ -z "$module_name" || -z "$full_ref" ]] && continue
+  # Repo URL = scheme + host + org + repo.git  (stops before //subdir)
+  # Works for both:
+  #   https://github.com/org/tf-module-vpc.git
+  #   https://github.com/org/monorepo.git//modules/vpc
+  repo_url=$(echo "$url_part" | sed -E 's|(https?://[^/]+/[^/]+/[^/?]+).*|\1|')
+
+  # ── Parse current ref ──────────────────────────────────────────────────────
+  current_ref="${source_line##*\?ref=}"
+
+  [[ -z "$repo_url" || -z "$current_ref" ]] && continue
+
+  # ── Derive module name ─────────────────────────────────────────────────────
+  # Look for a //subdir AFTER the repo URL (skip the https:// protocol part)
+  after_repo=$(echo "$url_part" | sed -E 's|https?://[^/]+/[^/]+/[^/?]+||')
+  subpath=$(echo "$after_repo" | grep -oE '//[^?]+' 2>/dev/null | sed 's|^//||' | head -1 || true)
+  if [[ -n "$subpath" ]]; then
+    # monorepo style: //modules/vpc → module = vpc
+    module_name=$(basename "$subpath")
+  else
+    # multi-repo style: repo name is the module name
+    module_name=$(basename "$repo_url" .git)
+    module_name="${module_name#tf-module-}"
+    module_name="${module_name#terraform-}"
+    module_name="${module_name#terraform-aws-}"
+  fi
+
+  # ── Determine tag prefix ───────────────────────────────────────────────────
+  # Monorepo style:  ref = "vpc/v1.0.0"  → prefix = "vpc/"
+  # Multi-repo style: ref = "v1.0.0"     → prefix = ""
+  if [[ "$current_ref" =~ ^[^/]+/v[0-9] ]]; then
+    tag_prefix="${current_ref%%/v*}/"
+    version_part="v${current_ref##*/v}"
+  else
+    tag_prefix=""
+    version_part="$current_ref"
+  fi
 
   stack_rel="${tg_file%/terragrunt.hcl}"
   stack_rel="${stack_rel#"$LIVE_ROOT/"}"
 
-  latest_ver=$(get_latest_version "$module_name")
+  # ── Get latest version for this repo ──────────────────────────────────────
+  latest_version=$(get_latest_version "$repo_url" "$tag_prefix")
+
+  if [[ -n "$tag_prefix" ]]; then
+    latest_ref="${tag_prefix}${latest_version}"
+  else
+    latest_ref="$latest_version"
+  fi
 
   TOTAL=$((TOTAL + 1))
 
-  if [[ "$full_ref" == "$latest_ver" ]]; then
+  if [[ "$current_ref" == "$latest_ref" ]]; then
     status="✓ up to date"
   else
     status="⚠  BEHIND"
     STALE=$((STALE + 1))
-    STALE_ENTRIES+=("${stack_rel}|${module_name}|${full_ref}|${latest_ver}")
+    STALE_ENTRIES+=("${stack_rel}|${module_name}|${current_ref}|${latest_ref}")
   fi
 
   ROWS+=("$(printf '%-38s %-8s %-10s %-10s %s' \
-    "$stack_rel" "$module_name" "$full_ref" "$latest_ver" "$status")")
+    "$stack_rel" "$module_name" "$current_ref" "$latest_ref" "$status")")
 
 done < <(find "$SEARCH_ROOT" -name "terragrunt.hcl" -print0 | sort -z)
 
-# ── Report ─────────────────────────────────────────────────────────────────────
+# ── Report ────────────────────────────────────────────────────────────────────
 printf "\n"
 printf '%-38s %-8s %-10s %-10s %s\n' \
   "Stack" "Module" "Current" "Latest" "Status"
@@ -113,9 +167,7 @@ printf '%-38s %-8s %-10s %-10s %s\n' \
   "$(printf '%0.s─' {1..10})" \
   "$(printf '%0.s─' {1..14})"
 
-for row in "${ROWS[@]}"; do
-  echo "$row"
-done
+for row in "${ROWS[@]}"; do echo "$row"; done
 
 printf "\n"
 if [[ $STALE -eq 0 ]]; then
@@ -123,15 +175,13 @@ if [[ $STALE -eq 0 ]]; then
 else
   echo "⚠  ${STALE}/${TOTAL} stack(s) are behind the latest module tags."
   echo ""
-  echo "To refresh a stale module, push a new tag or trigger the refresh pipeline:"
-  echo "  gitops/refresh-pipeline  MODULE_NAME=<name>  MODULE_VERSION=<latest>"
+  echo "Set UPDATE_MODULES=true in the live-infra pipeline to bump and commit."
 fi
 printf "\n"
 
-# ── Write machine-readable updates file (for downstream update step) ────────────
+# ── Write machine-readable updates file (for downstream update step) ──────────
 if [[ -n "$UPDATES_FILE" && ${#STALE_ENTRIES[@]} -gt 0 ]]; then
   printf '%s\n' "${STALE_ENTRIES[@]}" > "$UPDATES_FILE"
 fi
 
-# Exit code = number of stale stacks (0 = clean, >0 = drift detected)
 exit $STALE

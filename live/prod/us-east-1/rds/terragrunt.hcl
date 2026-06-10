@@ -12,7 +12,7 @@ dependency "vpc" {
 }
 
 terraform {
-  source = "git::https://github.com/beravelli/autotfrefresh.git//modules/rds?ref=rds/v1.0.0"
+  source = "git::https://github.com/beravelli/tf-module-rds.git?ref=v1.0.0"
 }
 
 inputs = {
